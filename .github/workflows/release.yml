@@ -33,4 +33,10 @@ jobs:
             dist/*.zip
             dist/checksums.txt
       - name: Ask proxy.golang.org to fetch the tag (pkg.go.dev picks it up from there)
-        run: curl -fsS "https://proxy.golang.org/github.com/slidecold/slidecold-go/@v/${GITHUB_REF_NAME}.info"
+        # The proxy can cache "unknown revision" for a just-pushed tag, so retry instead of failing the release
+        run: |
+          for i in $(seq 10); do
+            curl -fsS "https://proxy.golang.org/github.com/slidecold/slidecold-go/@v/${GITHUB_REF_NAME}.info" && exit 0
+            sleep 60
+          done
+          echo "::warning::proxy.golang.org has not picked up ${GITHUB_REF_NAME} yet; it will on first go get"
