@@ -1,0 +1,57 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (Go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ['1.22', 'stable']
+    env:
+      # The MCP server is a nested module that needs Go >= 1.25 (go-sdk), so on
+      # Go 1.22 the workspace is off and only the root module (SDK, CLI) is checked.
+      GOWORK: ${{ matrix.go == '1.22' && 'off' || '' }}
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - name: Generated code is up to date
+        run: |
+          go generate ./...
+          git diff --exit-code
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -race ./...
+      - name: MCP server (vet, test)
+        if: matrix.go == 'stable'
+        run: |
+          go vet ./cmd/slidecold-mcp/...
+          go test -race ./cmd/slidecold-mcp/...
+      - name: Build binaries
+        run: go build ./cmd/slidecold ${{ matrix.go == 'stable' && './cmd/slidecold-mcp' || '' }}
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: latest
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: latest
+          working-directory: cmd/slidecold-mcp

@@ -1,0 +1,8 @@
+go 1.25.0
+
+use (
+	.
+	./cmd/slidecold-mcp
+)
+
+replace github.com/slidecold/slidecold-go v0.1.0 => ./

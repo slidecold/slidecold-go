@@ -1,0 +1,8 @@
+/dist/
+/slidecold
+/slidecold-mcp
+*.exe
+*.test
+*.out
+coverage.*
+.DS_Store

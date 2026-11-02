@@ -1,0 +1,1916 @@
+openapi: 3.1.0
+info:
+  title: SlideCold API
+  version: 1.0.0
+  description: |
+    Public REST API for SlideCold (Instagram cold-DM outreach). Derived from the route handlers in
+    `src/app/api/v1/**/route.ts`. Authenticate with an API key: `Authorization: Bearer cs_...`.
+
+    Each key carries scopes `<resource>:<read|write>` for `accounts`, `audiences`, `campaigns` and
+    `conversations`; a `:write` scope also grants `:read`. The scope an operation needs is given in
+    its `x-required-scope` extension. A request without a valid key returns `401`; a key missing the
+    scope returns `403` with `{"error": "This API key is missing the <resource>:<action> scope"}`.
+    If the key's owner is a team MEMBER, their team scopes are also checked (403
+    `You don't have <action> access to <resource>`) and data is scoped to the team owner.
+
+    Several operations enqueue background work and return `202 {"jobId": "..."}`. Login jobs
+    (createAccount, reloginAccount, checkAccountSession) can be polled with getLoginStatus.
+
+    API keys never receive stored credentials: Instagram passwords, TOTP secrets and proxy
+    passwords are omitted from every response.
+  license:
+    name: MIT
+    identifier: MIT
+servers:
+  - url: https://slidecold.com/api/v1
+security:
+  - bearerAuth: []
+tags:
+  - name: Accounts
+    description: 'Instagram accounts: login, session, warmup, inbox listening.'
+  - name: Audiences
+    description: 'Target lists: scraping, import, export.'
+  - name: Campaigns
+    description: Cold-DM campaigns and their recipients.
+  - name: Conversations
+    description: 'DM threads: read, reply, export leads.'
+  - name: Folders
+    description: Folders for campaigns, audiences and accounts.
+  - name: Proxies
+    description: Proxies used by Instagram accounts.
+
+paths:
+  # ───────────────────────────── Campaigns ─────────────────────────────
+  /campaigns:
+    get:
+      tags: [Campaigns]
+      operationId: listCampaigns
+      summary: List campaigns
+      description: Returns non-archived campaigns, newest first. With `archived=true`, returns only ARCHIVED campaigns (and `folderId` is ignored).
+      x-required-scope: campaigns:read
+      parameters:
+        - $ref: '#/components/parameters/FolderIdQuery'
+        - name: archived
+          in: query
+          description: '`true` to list only archived campaigns.'
+          schema: { type: string, enum: ['true', 'false'] }
+      responses:
+        '200':
+          description: Campaigns
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/CampaignListItem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Campaigns]
+      operationId: createCampaign
+      summary: Create a campaign
+      description: |
+        Creates a DRAFT campaign with templates, follow-ups, accounts and audiences, and creates a PENDING
+        recipient for every (deduplicated) member of the given audiences. `timezone` is accepted but ignored:
+        the user's account timezone is used. Validation errors are reported as `"<field>: <message>"`.
+      x-required-scope: campaigns:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateCampaignRequest' }
+      responses:
+        '201':
+          description: Created campaign
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CampaignCreated' }
+        '400':
+          description: Invalid JSON, validation error, or pre-warm enabled while an account has no proxy.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: One or more audiences / accounts not found.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /campaigns/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [Campaigns]
+      operationId: getCampaign
+      summary: Get a campaign
+      x-required-scope: campaigns:read
+      responses:
+        '200':
+          description: Campaign with stats and queued recipients
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CampaignDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Error'
+                  - type: object
+                    properties:
+                      details: { type: string }
+    patch:
+      tags: [Campaigns]
+      operationId: updateCampaign
+      summary: Update a campaign
+      description: |
+        Partial update. Setting `status: ACTIVE` requires at least one template, a primary audience with members,
+        and at least one ACTIVE account. Passing `audienceIds` replaces the audiences and adds recipients for new
+        members (existing recipients are kept). Passing `accountIds` replaces the accounts. `timezone` is ignored.
+      x-required-scope: campaigns:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateCampaignRequest' }
+      responses:
+        '200':
+          description: Updated campaign
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CampaignUpdated' }
+        '400':
+          description: Invalid JSON, validation error, activation preconditions failed, or pre-warm without proxies.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: Campaign, or one of the given audiences / accounts, not found.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    delete:
+      tags: [Campaigns]
+      operationId: deleteCampaign
+      summary: Delete a campaign
+      x-required-scope: campaigns:write
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /campaigns/{id}/stats:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [Campaigns]
+      operationId: getCampaignStats
+      summary: Get campaign stats
+      description: '`totalPending` counts PENDING + QUEUED. `replyRate` is round(replied / (sent + replied) * 100).'
+      x-required-scope: campaigns:read
+      responses:
+        '200':
+          description: Stats
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CampaignStats' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /campaigns/{id}/recipients:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [Campaigns]
+      operationId: listCampaignRecipients
+      summary: List campaign recipients
+      description: Returns all recipients (unpaginated).
+      x-required-scope: campaigns:read
+      parameters:
+        - name: status
+          in: query
+          description: Filter by recipient status; `ALL` or omitted for all.
+          schema:
+            anyOf:
+              - $ref: '#/components/schemas/RecipientStatus'
+              - { type: string, const: ALL }
+      responses:
+        '200':
+          description: Recipients
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/CampaignRecipient' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /campaigns/{id}/retry:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    post:
+      tags: [Campaigns]
+      operationId: retryCampaign
+      summary: Retry failed recipients
+      description: Resets FAILED recipients to PENDING. A COMPLETED campaign with at least one retried recipient is set back to ACTIVE.
+      x-required-scope: campaigns:write
+      responses:
+        '200':
+          description: Retry result
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, retriedCount]
+                properties:
+                  success: { type: boolean, const: true }
+                  retriedCount: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ───────────────────────────── Audiences ─────────────────────────────
+  /audiences:
+    get:
+      tags: [Audiences]
+      operationId: listAudiences
+      summary: List audiences
+      x-required-scope: audiences:read
+      parameters:
+        - $ref: '#/components/parameters/FolderIdQuery'
+      responses:
+        '200':
+          description: Audiences
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/AudienceWithCount' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Audiences]
+      operationId: createAudience
+      summary: Create an audience
+      x-required-scope: audiences:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateAudienceRequest' }
+      responses:
+        '201':
+          description: Created audience
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Audience' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /audiences/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [Audiences]
+      operationId: getAudience
+      summary: Get an audience
+      x-required-scope: audiences:read
+      responses:
+        '200':
+          description: Audience
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AudienceWithCount' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Audiences]
+      operationId: updateAudience
+      summary: Update an audience
+      description: Only the listed fields are applied; there is no schema validation. Empty `description` / `folderId` become null.
+      x-required-scope: audiences:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                description: { type: [string, 'null'] }
+                sourceValue: { type: string }
+                filters: { $ref: '#/components/schemas/AudienceFilters' }
+                folderId: { type: [string, 'null'] }
+      responses:
+        '200':
+          description: Updated audience
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AudienceWithCount' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Audiences]
+      operationId: deleteAudience
+      summary: Delete an audience
+      description: Fails with 409 if an ACTIVE campaign uses it as its primary audience; otherwise unlinks it from other campaigns and deletes it.
+      x-required-scope: audiences:write
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /audiences/{id}/members:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [Audiences]
+      operationId: listAudienceMembers
+      summary: List audience members
+      description: Paginated, newest scraped first. `search` matches username, full name or bio (case-insensitive).
+      x-required-scope: audiences:read
+      parameters:
+        - { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { name: search, in: query, schema: { type: string } }
+        - { name: minFollowers, in: query, schema: { type: integer } }
+        - { name: maxFollowers, in: query, schema: { type: integer } }
+      responses:
+        '200':
+          description: Page of members
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [members, total, page, totalPages]
+                properties:
+                  members:
+                    type: array
+                    items: { $ref: '#/components/schemas/AudienceMember' }
+                  total: { type: integer }
+                  page: { type: integer }
+                  totalPages: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /audiences/{id}/import:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    post:
+      tags: [Audiences]
+      operationId: importAudienceMembers
+      summary: Import members
+      description: |
+        Three input forms: JSON with a single `username` (plus optional profile fields), JSON with a
+        `usernames` string array, or a multipart CSV `file` (required column `username`/`instagram_username`/
+        `ig_username`; optional `full_name`, `followers`, `following`, `bio`, `last_post_date`). Leading `@` is
+        stripped. Max 10,000 per import. Existing members are left untouched but still counted in `imported`.
+      x-required-scope: audiences:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  required: [username]
+                  properties:
+                    username: { type: string }
+                    fullName: { type: string }
+                    followerCount: { type: integer }
+                    followingCount: { type: integer }
+                    bio: { type: string }
+                - type: object
+                  required: [usernames]
+                  properties:
+                    usernames:
+                      type: array
+                      maxItems: 10000
+                      items: { type: string }
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, contentMediaType: text/csv }
+      responses:
+        '200':
+          description: Import result
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [imported, skipped, total]
+                properties:
+                  imported: { type: integer, description: Upserts that succeeded (includes already-existing members). }
+                  skipped: { type: integer, description: Upserts that failed. }
+                  total: { type: integer, description: Audience member count after import. }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /audiences/{id}/export:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [Audiences]
+      operationId: exportAudience
+      summary: Export members as CSV
+      description: 'Columns: `username,fullName,followerCount,followingCount,bio,isVerified`. Sent as an attachment.'
+      x-required-scope: audiences:read
+      responses:
+        '200':
+          description: CSV file
+          headers:
+            Content-Disposition:
+              schema: { type: string }
+          content:
+            text/csv:
+              schema: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /audiences/{id}/scrape:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    post:
+      tags: [Audiences]
+      operationId: startAudienceScrape
+      summary: Start scraping
+      description: Queues a scrape of the audience source using the given Instagram account and sets status to SCRAPING.
+      x-required-scope: audiences:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [accountId]
+              properties:
+                accountId: { type: string, minLength: 1 }
+                limit: { type: integer, minimum: 1, maximum: 20000, default: 20000 }
+      responses:
+        '202':
+          description: Scrape queued
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [message, jobId, audienceId]
+                properties:
+                  message: { type: string, const: Scrape job queued }
+                  jobId: { type: string }
+                  audienceId: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: Audience or Instagram account not found.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '409':
+          description: Already scraping.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    delete:
+      tags: [Audiences]
+      operationId: stopAudienceScrape
+      summary: Stop scraping
+      description: Signals the scrape job to stop and marks the audience COMPLETE.
+      x-required-scope: audiences:write
+      responses:
+        '200':
+          description: Stopped
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, totalCount]
+                properties:
+                  success: { type: boolean, const: true }
+                  totalCount: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ─────────────────────────── Conversations ───────────────────────────
+  /conversations:
+    get:
+      tags: [Conversations]
+      operationId: listConversations
+      summary: List conversations
+      description: Paginated, most recent message first.
+      x-required-scope: conversations:read
+      parameters:
+        - { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 50, default: 20 } }
+        - name: status
+          in: query
+          description: Conversation status (case-insensitive) or `all`.
+          schema: { type: string }
+        - { name: campaignId, in: query, schema: { type: string } }
+        - { name: accountId, in: query, description: Instagram account id., schema: { type: string } }
+        - { name: search, in: query, description: Substring of recipient username (case-insensitive)., schema: { type: string } }
+      responses:
+        '200':
+          description: Page of conversations
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [conversations, pagination]
+                properties:
+                  conversations:
+                    type: array
+                    items: { $ref: '#/components/schemas/ConversationListItem' }
+                  pagination:
+                    type: object
+                    required: [page, limit, total, totalPages]
+                    properties:
+                      page: { type: integer }
+                      limit: { type: integer }
+                      total: { type: integer }
+                      totalPages: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /conversations/refresh:
+    post:
+      tags: [Conversations]
+      operationId: refreshConversations
+      summary: Sync inboxes
+      description: Synchronously syncs the inbox of every account that has an open (SENT/READ/REPLIED) conversation.
+      x-required-scope: conversations:write
+      responses:
+        '200':
+          description: Sync result
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [updated, newMessages, accountsSynced]
+                properties:
+                  updated: { type: integer }
+                  newMessages: { type: integer }
+                  accountsSynced: { type: integer }
+                  errors:
+                    type: array
+                    items: { type: string }
+                    description: Present only when there were errors.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /conversations/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [Conversations]
+      operationId: getConversation
+      summary: Get a conversation
+      description: Returns the conversation with all messages (oldest first). Side effect - marks unread inbound messages as read (the returned messages still show their prior `isRead`).
+      x-required-scope: conversations:read
+      responses:
+        '200':
+          description: Conversation
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConversationDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Conversations]
+      operationId: updateConversation
+      summary: Update a conversation
+      x-required-scope: conversations:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                status: { $ref: '#/components/schemas/ConversationStatus' }
+                notes: { type: string }
+      responses:
+        '200':
+          description: Updated conversation
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Conversation' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /conversations/{id}/reply:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    post:
+      tags: [Conversations]
+      operationId: sendConversationReply
+      summary: Send a text reply
+      description: Sends via the worker and waits up to 20 s for Instagram to confirm, then returns the stored message.
+      x-required-scope: conversations:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [message]
+              properties:
+                message: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        '201':
+          description: Sent message
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Message' }
+        '400':
+          description: Invalid message, account deleted, or recipient user id unknown.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429':
+          description: Rate limited by Instagram.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /conversations/{id}/photo:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    post:
+      tags: [Conversations]
+      operationId: sendConversationPhoto
+      summary: Send a photo
+      description: Queues a photo send; the message appears in the conversation once the worker delivers it.
+      x-required-scope: conversations:write
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [photo]
+              properties:
+                photo: { type: string, contentMediaType: application/octet-stream }
+      responses:
+        '202': { $ref: '#/components/responses/JobAccepted' }
+        '400':
+          description: No photo, account deleted, or recipient user id unknown.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /conversations/{id}/crm:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    post:
+      tags: [Conversations]
+      operationId: exportConversationLead
+      summary: Export as lead
+      description: |
+        Builds a lead (enriched from the matching audience member, last 5 messages), fires the `lead.imported`
+        webhook event, optionally POSTs the lead to `webhookUrl` (failures ignored), and returns it as JSON or CSV.
+        The body is optional.
+      x-required-scope: conversations:write
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                webhookUrl: { type: string, format: uri }
+                format: { type: string, enum: [json, csv], default: json }
+      responses:
+        '200':
+          description: Lead
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [lead]
+                properties:
+                  lead: { $ref: '#/components/schemas/Lead' }
+            text/csv:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /conversations/{id}/messages/{messageId}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+      - name: messageId
+        in: path
+        required: true
+        schema: { type: string }
+    delete:
+      tags: [Conversations]
+      operationId: deleteConversationMessage
+      summary: Delete (unsend) a message
+      description: Deletes the message locally and, when possible, queues a best-effort unsend on Instagram.
+      x-required-scope: conversations:write
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: Conversation or message not found.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  # ───────────────────────────── Accounts ─────────────────────────────
+  /accounts:
+    get:
+      tags: [Accounts]
+      operationId: listAccounts
+      summary: List Instagram accounts
+      x-required-scope: accounts:read
+      parameters:
+        - $ref: '#/components/parameters/FolderIdQuery'
+      responses:
+        '200':
+          description: Accounts
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Account' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Accounts]
+      operationId: createAccount
+      summary: Add an Instagram account
+      description: |
+        Queues a login job. A proxy (`proxyId` or inline `proxy`) is required in production. The login may need
+        2FA or a challenge (see `verifyAccount2fa` / `verifyAccountChallenge`). Body validation uses a throwing
+        parse, so a malformed body yields a 500 rather than a 400.
+      x-required-scope: accounts:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string, minLength: 1 }
+                password: { type: string, minLength: 1 }
+                displayName: { type: string }
+                totpSecret: { type: string }
+                proxyId: { type: string }
+                proxy: { $ref: '#/components/schemas/InlineProxy' }
+      responses:
+        '202': { $ref: '#/components/responses/JobAccepted' }
+        '400':
+          description: No proxy given (production).
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: 'Missing scope, or plan account limit reached (`Plan limit: max N accounts`).'
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '404':
+          description: User not found.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '409':
+          description: Account already added.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /accounts/login-status:
+    get:
+      tags: [Accounts]
+      operationId: getLoginStatus
+      summary: Poll a login job
+      description: Status of a job returned by createAccount, reloginAccount or checkAccountSession.
+      x-required-scope: accounts:read
+      parameters:
+        - { name: jobId, in: query, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Job state
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [state]
+                properties:
+                  state: { type: string, enum: [waiting, delayed, active, completed, failed, prioritized, waiting-children, unknown] }
+                  result: { description: Present when completed. }
+                  error: { type: string, description: Present when failed. }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /accounts/proxy-health:
+    get:
+      tags: [Accounts]
+      operationId: getAccountsProxyHealth
+      summary: Proxy health per account
+      description: Tests each account's proxy (results cached for 10 minutes). Keyed by account id.
+      x-required-scope: accounts:read
+      responses:
+        '200':
+          description: Map of account id to health
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: { $ref: '#/components/schemas/ProxyHealth' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /accounts/verify-2fa:
+    post:
+      tags: [Accounts]
+      operationId: verifyAccount2fa
+      summary: Submit a 2FA code
+      description: Continues a login that required two-factor auth. `identifier` and `partialSession` come from the login job result. Malformed bodies yield 500.
+      x-required-scope: accounts:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code, identifier, partialSession, username]
+              properties:
+                code: { type: string, minLength: 6 }
+                identifier: { type: string }
+                partialSession: { $ref: '#/components/schemas/PartialSession' }
+                username: { type: string }
+                proxyId: { type: string }
+      responses:
+        '202': { $ref: '#/components/responses/JobAccepted' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /accounts/verify-challenge:
+    post:
+      tags: [Accounts]
+      operationId: verifyAccountChallenge
+      summary: Submit a challenge code
+      description: Continues a login that hit an Instagram checkpoint. `checkpointUrl` and `partialSession` come from the login job result. Malformed bodies yield 500.
+      x-required-scope: accounts:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code, checkpointUrl, partialSession, username]
+              properties:
+                code: { type: string, minLength: 4 }
+                checkpointUrl: { type: string }
+                partialSession: { $ref: '#/components/schemas/PartialSession' }
+                username: { type: string }
+                proxyId: { type: string }
+                displayName: { type: string }
+      responses:
+        '202': { $ref: '#/components/responses/JobAccepted' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /accounts/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [Accounts]
+      operationId: getAccount
+      summary: Get an account
+      x-required-scope: accounts:read
+      responses:
+        '200':
+          description: Account
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Account' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Accounts]
+      operationId: updateAccount
+      summary: Update an account
+      description: |
+        No schema validation; only the listed fields are read. If `forceRelogin` is true and `username` + `password`
+        are given, credentials are replaced and a re-login is queued (202). Otherwise fields are updated (200).
+        In production a proxy cannot be removed (only replaced) and warmup requires a proxy.
+      x-required-scope: accounts:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                forceRelogin: { type: boolean }
+                username: { type: string }
+                password: { type: string }
+                displayName: { type: [string, 'null'] }
+                proxyId: { type: [string, 'null'] }
+                proxy: { $ref: '#/components/schemas/InlineProxy' }
+                removeProxy: { type: boolean }
+                warmupMode: { type: boolean }
+                folderId: { type: [string, 'null'] }
+                maxDailyLimit: { type: integer, minimum: 1 }
+                userAgent: { type: [string, 'null'], description: Ignored (set to null) unless it is a known user agent. }
+                warmupConfig: { type: object, additionalProperties: true }
+                totpSecret: { type: [string, 'null'] }
+      responses:
+        '200':
+          description: Updated account (no `proxy` include).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountBase'
+        '202': { $ref: '#/components/responses/JobAccepted' }
+        '400':
+          description: Proxy removal or warmup without proxy (production).
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Accounts]
+      operationId: deleteAccount
+      summary: Delete an account
+      description: Returns success even if the account does not exist.
+      x-required-scope: accounts:write
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /accounts/{id}/check-session:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    post:
+      tags: [Accounts]
+      operationId: checkAccountSession
+      summary: Check the Instagram session
+      description: Queues a session check; the account status is updated by the worker.
+      x-required-scope: accounts:write
+      responses:
+        '202': { $ref: '#/components/responses/JobAccepted' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /accounts/{id}/relogin:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    post:
+      tags: [Accounts]
+      operationId: reloginAccount
+      summary: Re-login with stored credentials
+      x-required-scope: accounts:write
+      responses:
+        '202': { $ref: '#/components/responses/JobAccepted' }
+        '400':
+          description: No stored credentials.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /accounts/{id}/listening:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    patch:
+      tags: [Accounts]
+      operationId: setAccountListening
+      summary: Toggle inbox listening
+      description: When enabling, runs a one-time inbox sync and returns its result.
+      x-required-scope: accounts:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties:
+                enabled: { type: boolean }
+      responses:
+        '200':
+          description: New state
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [listeningEnabled]
+                properties:
+                  listeningEnabled: { type: boolean }
+                  syncResult:
+                    description: Present only when enabling.
+                    type: object
+                    properties:
+                      updated: { type: integer }
+                      newMessages: { type: integer }
+                      errors: { type: array, items: { type: string } }
+                      error: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /accounts/{id}/warmup-history:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [Accounts]
+      operationId: getAccountWarmupHistory
+      summary: Warmup history by day
+      description: Last 500 warmup log entries grouped by UTC date, newest first.
+      x-required-scope: accounts:read
+      responses:
+        '200':
+          description: History
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [days]
+                properties:
+                  days:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        date: { type: string, format: date }
+                        totalActions: { type: integer }
+                        failedCount: { type: integer }
+                        summary: { type: object, additionalProperties: { type: integer } }
+                        logs:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              action: { type: string }
+                              target: { type: [string, 'null'] }
+                              details: { type: [string, 'null'] }
+                              createdAt: { type: string, format: date-time }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /accounts/{id}/warmup-logs:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [Accounts]
+      operationId: getAccountWarmupStatus
+      summary: Warmup status and recent logs
+      description: Last 50 logs, today's schedule and progress, and upcoming warmup sessions.
+      x-required-scope: accounts:read
+      responses:
+        '200':
+          description: Warmup status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  logs:
+                    type: array
+                    items: { $ref: '#/components/schemas/WarmupLog' }
+                  activeFollows: { type: integer }
+                  totalUnfollowed: { type: integer }
+                  schedule:
+                    type: object
+                    description: 'Day schedule: day, rest, likes, follows, coldDMs, reelMinutes, feedMinutes, storyViews, saves, shares, commentScrolls, exploreMins, searches, sessions, maxDMsOverride.'
+                    additionalProperties: true
+                  today:
+                    type: object
+                    description: "Today's counts: likes, follows, coldDMs, saves, shares, commentScrolls, browseFeed, watchReels, watchStories, browseExplore, searches."
+                    additionalProperties: { type: integer }
+                  nextWarmupAt: { type: [string, 'null'], format: date-time }
+                  upcomingSessions:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        session: { type: integer }
+                        totalSessions: { type: integer }
+                        scheduledAt: { type: string, format: date-time }
+                        isActive: { type: boolean }
+                        actions:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              label: { type: string }
+                              count: { type: integer }
+                              unit: { type: string }
+                  lastActivity: { type: [string, 'null'], format: date-time }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ───────────────────────────── Proxies ─────────────────────────────
+  /proxies:
+    get:
+      tags: [Proxies]
+      operationId: listProxies
+      summary: List proxies
+      x-required-scope: accounts:read
+      responses:
+        '200':
+          description: Proxies
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  allOf:
+                    - $ref: '#/components/schemas/Proxy'
+                    - type: object
+                      properties:
+                        instagramAccounts:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              id: { type: string }
+                              username: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Proxies]
+      operationId: createProxy
+      summary: Add a proxy
+      description: Malformed bodies yield 500 (throwing parse).
+      x-required-scope: accounts:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [host, port]
+              properties:
+                host: { type: string, minLength: 1 }
+                port:
+                  description: Number or numeric string (coerced).
+                  type: [integer, string]
+                  minimum: 1
+                  maximum: 65535
+                username: { type: string }
+                password: { type: string }
+                protocol: { $ref: '#/components/schemas/ProxyProtocol' }
+      responses:
+        '201':
+          description: Created proxy
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Proxy' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /proxies/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    patch:
+      tags: [Proxies]
+      operationId: updateProxy
+      summary: Update a proxy
+      description: Returns success even if no proxy matched.
+      x-required-scope: accounts:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                host: { type: string, minLength: 1 }
+                port: { type: [integer, string], minimum: 1, maximum: 65535 }
+                username: { type: [string, 'null'] }
+                password: { type: [string, 'null'] }
+                protocol: { $ref: '#/components/schemas/ProxyProtocol' }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    delete:
+      tags: [Proxies]
+      operationId: deleteProxy
+      summary: Delete a proxy
+      description: Returns success even if no proxy matched.
+      x-required-scope: accounts:write
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /proxies/{id}/test:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    post:
+      tags: [Proxies]
+      operationId: testProxy
+      summary: Test a proxy
+      description: Fetches the exit IP through the proxy (always as an HTTP proxy) and records the result.
+      x-required-scope: accounts:write
+      responses:
+        '200':
+          description: Proxy works
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, ip, latencyMs]
+                properties:
+                  success: { type: boolean, const: true }
+                  ip: { type: string }
+                  latencyMs: { type: integer }
+        '400':
+          description: Proxy failed
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, error]
+                properties:
+                  success: { type: boolean, const: false }
+                  error: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ───────────────────────────── Folders ─────────────────────────────
+  /folders:
+    get:
+      tags: [Folders]
+      operationId: listFolders
+      summary: List folders
+      description: |
+        Required scope depends on `type`: CAMPAIGN → `campaigns:read`, AUDIENCE → `audiences:read`,
+        ACCOUNT or omitted → `accounts:read`. Without `type`, folders of all types are returned. Returns
+        root folders unless `parentId` is given.
+      x-required-scope: campaigns:read | audiences:read | accounts:read
+      parameters:
+        - name: type
+          in: query
+          schema: { $ref: '#/components/schemas/FolderType' }
+        - name: parentId
+          in: query
+          description: Parent folder id; `root` or omitted for root folders.
+          schema: { type: string }
+      responses:
+        '200':
+          description: Folders, sorted by name
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/FolderWithCounts' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Folders]
+      operationId: createFolder
+      summary: Create a folder
+      description: |
+        Required scope depends on body `type`: CAMPAIGN → `campaigns:write`, AUDIENCE → `audiences:write`,
+        ACCOUNT → `accounts:write`. The body is validated before authentication, so a bad body returns 400 even
+        without credentials. A duplicate name under the same parent violates a unique constraint (500).
+      x-required-scope: campaigns:write | audiences:write | accounts:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, type]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 100 }
+                type: { $ref: '#/components/schemas/FolderType' }
+                parentId: { type: string }
+      responses:
+        '201':
+          description: Created folder
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Folder' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: Parent folder not found (or of a different type).
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /folders/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    patch:
+      tags: [Folders]
+      operationId: updateFolder
+      summary: Rename or move a folder
+      description: Requires `accounts:write` regardless of the folder's type.
+      x-required-scope: accounts:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, minLength: 1, maxLength: 100 }
+                parentId: { type: [string, 'null'] }
+      responses:
+        '200':
+          description: Updated folder
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Folder' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Folders]
+      operationId: deleteFolder
+      summary: Delete a folder
+      description: Requires `accounts:write` regardless of type. Items inside move to root; child folders move to this folder's parent.
+      x-required-scope: accounts:write
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { type: boolean, const: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: 'API key from Settings → API Keys, e.g. `cs_...`.'
+
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+    FolderIdQuery:
+      name: folderId
+      in: query
+      description: Folder id, or `root` for items not in any folder.
+      schema: { type: string }
+
+  responses:
+    Success:
+      description: Success
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [success]
+            properties:
+              success: { type: boolean, const: true }
+    JobAccepted:
+      description: Background job queued
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [jobId]
+            properties:
+              jobId: { type: string }
+    BadRequest:
+      description: Invalid input
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Unauthorized:
+      description: Missing or invalid API key (`Unauthorized` / `Invalid API key`).
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Forbidden:
+      description: API key lacks the required scope, or team member lacks access.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    NotFound:
+      description: Resource not found
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Conflict:
+      description: Conflict
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    InternalError:
+      description: Internal error
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
+
+    # ── enums ──
+    AccountStatus: { type: string, enum: [ACTIVE, LIMITED, BANNED, NEEDS_RELOGIN] }
+    AudienceSourceType: { type: string, enum: [HASHTAG, MENTION, LOCATION, FOLLOWERS, POST_LIKES, POST_COMMENTS] }
+    AudienceStatus: { type: string, enum: [PENDING, SCRAPING, COMPLETE, ERROR] }
+    CampaignStatus: { type: string, enum: [DRAFT, ACTIVE, PAUSED, COMPLETED, ARCHIVED] }
+    RecipientStatus: { type: string, enum: [PENDING, QUEUED, SENT, REPLIED, FAILED, SKIPPED, UNDELIVERABLE, WARMING, WARM_DONE] }
+    MessageDirection: { type: string, enum: [OUTBOUND, INBOUND] }
+    ConversationStatus: { type: string, enum: [SENT, READ, REPLIED, CLOSED, UNSUBSCRIBED] }
+    FolderType: { type: string, enum: [CAMPAIGN, AUDIENCE, ACCOUNT] }
+    ProxyProtocol: { type: string, enum: [HTTP, SOCKS5], default: HTTP }
+
+    # ── campaigns ──
+    CampaignTemplateInput:
+      type: object
+      required: [body]
+      properties:
+        body: { type: string, minLength: 1 }
+        imageUrl: { type: [string, 'null'] }
+        weight: { type: integer, minimum: 1, maximum: 10, default: 1 }
+    CampaignFollowupInput:
+      type: object
+      required: [body, delayHours]
+      properties:
+        body: { type: string, minLength: 1 }
+        imageUrl: { type: [string, 'null'] }
+        delayHours: { type: integer, minimum: 1, maximum: 720 }
+    CreateCampaignRequest:
+      type: object
+      required: [name, audienceIds, accountIds, templates]
+      properties:
+        name: { type: string, minLength: 1 }
+        audienceIds: { type: array, minItems: 1, items: { type: string, minLength: 1 } }
+        accountIds: { type: array, minItems: 1, items: { type: string, minLength: 1 } }
+        preWarmEnabled: { type: boolean, default: false }
+        dailyLimit: { type: integer, minimum: 1, maximum: 500, default: 10 }
+        sendDelayMin: { type: integer, minimum: 10, maximum: 600, default: 45, description: Seconds. }
+        sendDelayMax: { type: integer, minimum: 10, maximum: 600, default: 180, description: Seconds. }
+        startHour: { type: integer, minimum: 0, maximum: 23, default: 9 }
+        startMinute: { type: integer, minimum: 0, maximum: 59, default: 0 }
+        endHour: { type: integer, minimum: 0, maximum: 23, default: 17 }
+        endMinute: { type: integer, minimum: 0, maximum: 59, default: 0 }
+        timezone: { type: string, description: Ignored; the user's timezone is used. }
+        templates: { type: array, minItems: 1, items: { $ref: '#/components/schemas/CampaignTemplateInput' } }
+        followups: { type: array, maxItems: 5, default: [], items: { $ref: '#/components/schemas/CampaignFollowupInput' } }
+    UpdateCampaignRequest:
+      type: object
+      properties:
+        name: { type: string, minLength: 1 }
+        status: { $ref: '#/components/schemas/CampaignStatus' }
+        folderId: { type: [string, 'null'] }
+        preWarmEnabled: { type: boolean }
+        dailyLimit: { type: integer, minimum: 1, maximum: 500 }
+        sendDelayMin: { type: integer, minimum: 10, maximum: 600 }
+        sendDelayMax: { type: integer, minimum: 10, maximum: 600 }
+        startHour: { type: integer, minimum: 0, maximum: 23 }
+        startMinute: { type: integer, minimum: 0, maximum: 59 }
+        endHour: { type: integer, minimum: 0, maximum: 23 }
+        endMinute: { type: integer, minimum: 0, maximum: 59 }
+        timezone: { type: string, description: Ignored. }
+        audienceIds: { type: array, minItems: 1, items: { type: string, minLength: 1 } }
+        accountIds: { type: array, minItems: 1, items: { type: string, minLength: 1 } }
+    Campaign:
+      type: object
+      description: Campaign scalar fields. `audienceId` / `accountId` are legacy "primary" links (first of the lists).
+      properties:
+        id: { type: string }
+        userId: { type: string }
+        name: { type: string }
+        folderId: { type: [string, 'null'] }
+        status: { $ref: '#/components/schemas/CampaignStatus' }
+        audienceId: { type: [string, 'null'] }
+        accountId: { type: [string, 'null'] }
+        preWarmEnabled: { type: boolean }
+        dailyLimit: { type: integer }
+        sendDelayMin: { type: integer }
+        sendDelayMax: { type: integer }
+        startHour: { type: integer }
+        startMinute: { type: integer }
+        endHour: { type: integer }
+        endMinute: { type: integer }
+        timezone: { type: string }
+        totalSent: { type: integer }
+        totalReplied: { type: integer }
+        totalFailed: { type: integer }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+    CampaignTemplate:
+      type: object
+      properties:
+        id: { type: string }
+        campaignId: { type: string }
+        body: { type: string }
+        imageUrl: { type: [string, 'null'] }
+        weight: { type: integer }
+        sentCount: { type: integer }
+    CampaignFollowup:
+      type: object
+      properties:
+        id: { type: string }
+        campaignId: { type: string }
+        body: { type: string }
+        imageUrl: { type: [string, 'null'] }
+        delayHours: { type: integer }
+        step: { type: integer }
+    AudienceRef:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        totalCount: { type: integer }
+    AccountRef:
+      type: object
+      properties:
+        id: { type: string }
+        username: { type: string }
+        displayName: { type: [string, 'null'] }
+        status: { $ref: '#/components/schemas/AccountStatus' }
+    CampaignListItem:
+      allOf:
+        - $ref: '#/components/schemas/Campaign'
+        - type: object
+          properties:
+            audience: { anyOf: [{ $ref: '#/components/schemas/AudienceRef' }, { type: 'null' }] }
+            account: { anyOf: [{ $ref: '#/components/schemas/AccountRef' }, { type: 'null' }] }
+            audiences: { type: array, items: { $ref: '#/components/schemas/AudienceRef' } }
+            accounts: { type: array, items: { $ref: '#/components/schemas/AccountRef' } }
+            templates: { type: array, items: { type: object, properties: { id: { type: string } } } }
+            totalRecipients: { type: integer }
+            pendingCount: { type: integer }
+    CampaignCreated:
+      allOf:
+        - $ref: '#/components/schemas/Campaign'
+        - type: object
+          properties:
+            templates: { type: array, items: { $ref: '#/components/schemas/CampaignTemplate' } }
+            followups: { type: array, items: { $ref: '#/components/schemas/CampaignFollowup' } }
+            audiences: { type: array, items: { $ref: '#/components/schemas/AudienceRef' } }
+            accounts:
+              type: array
+              items: { type: object, properties: { id: { type: string }, username: { type: string } } }
+    CampaignUpdated:
+      allOf:
+        - $ref: '#/components/schemas/Campaign'
+        - type: object
+          properties:
+            templates: { type: array, items: { $ref: '#/components/schemas/CampaignTemplate' } }
+            audience:
+              anyOf:
+                - { type: object, properties: { id: { type: string }, name: { type: string } } }
+                - { type: 'null' }
+            audiences: { type: array, items: { $ref: '#/components/schemas/AudienceRef' } }
+            accounts:
+              type: array
+              items: { type: object, properties: { id: { type: string }, username: { type: string } } }
+    CampaignDetail:
+      allOf:
+        - $ref: '#/components/schemas/Campaign'
+        - type: object
+          properties:
+            templates: { type: array, items: { $ref: '#/components/schemas/CampaignTemplate' } }
+            audience: { anyOf: [{ $ref: '#/components/schemas/AudienceRef' }, { type: 'null' }] }
+            account: { anyOf: [{ $ref: '#/components/schemas/AccountRef' }, { type: 'null' }] }
+            audiences: { type: array, items: { $ref: '#/components/schemas/AudienceRef' } }
+            accounts: { type: array, items: { $ref: '#/components/schemas/AccountRef' } }
+            _count: { type: object, properties: { recipients: { type: integer } } }
+            totalRecipients: { type: integer }
+            sentToday: { type: integer }
+            queuedRecipients:
+              type: array
+              items:
+                type: object
+                properties:
+                  id: { type: string }
+                  username: { type: string }
+                  fullName: { type: [string, 'null'] }
+                  account: { type: [string, 'null'], description: Sending account display name or username. }
+            stats:
+              type: object
+              properties:
+                totalSent: { type: integer }
+                totalQueued: { type: integer }
+                totalPending: { type: integer }
+                totalPendingAll: { type: integer, description: PENDING + QUEUED. }
+                totalReplied: { type: integer }
+                totalFailed: { type: integer }
+                totalSkipped: { type: integer }
+                totalUndeliverable: { type: integer }
+                totalWarming: { type: integer }
+                totalWarmDone: { type: integer }
+    CampaignStats:
+      type: object
+      required: [totalSent, totalPending, totalReplied, totalFailed, totalSkipped, replyRate, templates]
+      properties:
+        totalSent: { type: integer }
+        totalPending: { type: integer }
+        totalReplied: { type: integer }
+        totalFailed: { type: integer }
+        totalSkipped: { type: integer }
+        replyRate: { type: integer, description: 'Percent, 0-100.' }
+        templates:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              body: { type: string }
+              sentCount: { type: integer }
+              replyCount: { type: integer }
+    CampaignRecipient:
+      type: object
+      properties:
+        id: { type: string }
+        status: { $ref: '#/components/schemas/RecipientStatus' }
+        username: { type: string }
+        fullName: { type: [string, 'null'] }
+        userId: { type: [string, 'null'], description: Instagram user id. }
+        account: { type: [string, 'null'], description: Sending account display name or username. }
+        sentAt: { type: [string, 'null'], format: date-time }
+        errorReason: { type: [string, 'null'] }
+
+    # ── audiences ──
+    AudienceFilters:
+      type: object
+      properties:
+        bioKeywords: { type: array, items: { type: string } }
+        minFollowers: { type: integer, minimum: 0 }
+        maxFollowers: { type: integer, minimum: 0 }
+        minPosts: { type: integer, minimum: 0 }
+        maxPosts: { type: integer, minimum: 0 }
+        activeWithinDays: { type: integer, minimum: 1 }
+    CreateAudienceRequest:
+      type: object
+      required: [name, sourceType, sourceValue]
+      properties:
+        name: { type: string, minLength: 1 }
+        description: { type: string }
+        sourceType: { $ref: '#/components/schemas/AudienceSourceType' }
+        sourceValue: { type: string, minLength: 1 }
+        filters: { $ref: '#/components/schemas/AudienceFilters' }
+    Audience:
+      type: object
+      properties:
+        id: { type: string }
+        userId: { type: string }
+        name: { type: string }
+        folderId: { type: [string, 'null'] }
+        description: { type: [string, 'null'] }
+        sourceType: { $ref: '#/components/schemas/AudienceSourceType' }
+        sourceValue: { type: string }
+        filters: { anyOf: [{ $ref: '#/components/schemas/AudienceFilters' }, { type: 'null' }] }
+        scrapeLimit: { type: [integer, 'null'] }
+        scrapeJobId: { type: [string, 'null'] }
+        scrapeCursor: { type: [string, 'null'] }
+        totalCount: { type: integer }
+        status: { $ref: '#/components/schemas/AudienceStatus' }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+    AudienceWithCount:
+      allOf:
+        - $ref: '#/components/schemas/Audience'
+        - type: object
+          properties:
+            memberCount: { type: integer }
+    AudienceMember:
+      type: object
+      properties:
+        id: { type: string }
+        audienceId: { type: string }
+        instagramUsername: { type: string }
+        instagramUserId: { type: [string, 'null'] }
+        fullName: { type: [string, 'null'] }
+        followerCount: { type: [integer, 'null'] }
+        followingCount: { type: [integer, 'null'] }
+        bio: { type: [string, 'null'] }
+        isVerified: { type: boolean }
+        profilePicUrl: { type: [string, 'null'] }
+        lastPostAt: { type: [string, 'null'], format: date-time }
+        scrapedAt: { type: string, format: date-time }
+
+    # ── conversations ──
+    Conversation:
+      type: object
+      properties:
+        id: { type: string }
+        userId: { type: string }
+        instagramAccountId: { type: [string, 'null'] }
+        recipientUsername: { type: string }
+        recipientUserId: { type: [string, 'null'] }
+        igThreadId: { type: [string, 'null'] }
+        campaignId: { type: [string, 'null'] }
+        lastMessage: { type: [string, 'null'] }
+        lastMessageAt: { type: [string, 'null'], format: date-time }
+        status: { $ref: '#/components/schemas/ConversationStatus' }
+        notes: { type: [string, 'null'] }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+    ConversationListItem:
+      type: object
+      properties:
+        id: { type: string }
+        recipientUsername: { type: string }
+        recipientUserId: { type: [string, 'null'] }
+        profilePicUrl: { type: [string, 'null'] }
+        instagramAccountUsername: { type: string, description: 'Display name or username; "Deleted Account" if the account is gone.' }
+        instagramAccountId: { type: [string, 'null'] }
+        campaign:
+          anyOf:
+            - { type: object, properties: { id: { type: string }, name: { type: string } } }
+            - { type: 'null' }
+        lastMessage: { type: [string, 'null'] }
+        lastMessageAt: { type: [string, 'null'], format: date-time }
+        status: { $ref: '#/components/schemas/ConversationStatus' }
+        notes: { type: [string, 'null'] }
+        unreadCount: { type: integer }
+        createdAt: { type: string, format: date-time }
+    ConversationDetail:
+      allOf:
+        - $ref: '#/components/schemas/Conversation'
+        - type: object
+          properties:
+            instagramAccount:
+              anyOf:
+                - { type: object, properties: { username: { type: string }, displayName: { type: [string, 'null'] } } }
+                - { type: 'null' }
+            campaign:
+              anyOf:
+                - { type: object, properties: { id: { type: string }, name: { type: string } } }
+                - { type: 'null' }
+            messages: { type: array, items: { $ref: '#/components/schemas/Message' } }
+            profilePicUrl: { type: [string, 'null'] }
+    Message:
+      type: object
+      properties:
+        id: { type: string }
+        conversationId: { type: string }
+        direction: { $ref: '#/components/schemas/MessageDirection' }
+        body: { type: string }
+        mediaUrl: { type: [string, 'null'] }
+        mediaType: { type: [string, 'null'], description: 'e.g. image, video, reel, story_share.' }
+        igItemId: { type: [string, 'null'] }
+        sentAt: { type: string, format: date-time }
+        isRead: { type: boolean }
+    Lead:
+      type: object
+      properties:
+        recipientUsername: { type: string }
+        recipientUserId: { type: [string, 'null'] }
+        fullName: { type: [string, 'null'] }
+        bio: { type: [string, 'null'] }
+        conversationStatus: { $ref: '#/components/schemas/ConversationStatus' }
+        notes: { type: [string, 'null'] }
+        campaignName: { type: [string, 'null'] }
+        conversationSummary:
+          type: array
+          description: Last 5 messages, oldest first.
+          items:
+            type: object
+            properties:
+              direction: { $ref: '#/components/schemas/MessageDirection' }
+              body: { type: string }
+              sentAt: { type: string, format: date-time }
+        exportedAt: { type: string, format: date-time }
+
+    # ── accounts ──
+    InlineProxy:
+      type: object
+      required: [host, port]
+      properties:
+        host: { type: string }
+        port: { type: integer }
+        username: { type: string }
+        password: { type: string }
+    PartialSession:
+      type: object
+      required: [cookies, csrfToken, userId, username]
+      properties:
+        cookies: { type: string }
+        csrfToken: { type: string }
+        userId: { type: string }
+        username: { type: string }
+    AccountBase:
+      type: object
+      description: Instagram account fields (session cookies are never returned).
+      properties:
+        id: { type: string }
+        userId: { type: string }
+        username: { type: string }
+        displayName: { type: [string, 'null'] }
+        folderId: { type: [string, 'null'] }
+        proxyId: { type: [string, 'null'] }
+        deviceId: { type: string }
+        status: { $ref: '#/components/schemas/AccountStatus' }
+        dailySentCount: { type: integer }
+        maxDailyLimit: { type: integer }
+        followerCount: { type: [integer, 'null'] }
+        followingCount: { type: [integer, 'null'] }
+        userAgent: { type: [string, 'null'] }
+        lastActivity: { type: [string, 'null'], format: date-time }
+        warmupMode: { type: boolean }
+        warmupDay: { type: integer }
+        warmupLastDate: { type: [string, 'null'] }
+        lastDailyReset: { type: [string, 'null'] }
+        dailyLikeCount: { type: integer }
+        dailyFollowCount: { type: integer }
+        warmupConfig: { type: [object, 'null'], additionalProperties: true }
+        listeningEnabled: { type: boolean }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+    Account:
+      allOf:
+        - $ref: '#/components/schemas/AccountBase'
+        - type: object
+          properties:
+            proxy:
+              anyOf:
+                - type: object
+                  properties:
+                    host: { type: string }
+                    port: { type: integer }
+                    username: { type: [string, 'null'] }
+                - { type: 'null' }
+            hasPassword: { type: boolean }
+            hasTotpSecret: { type: boolean }
+    WarmupLog:
+      type: object
+      properties:
+        id: { type: string }
+        accountId: { type: [string, 'null'] }
+        action: { type: string }
+        target: { type: [string, 'null'] }
+        details: { type: [string, 'null'] }
+        createdAt: { type: string, format: date-time }
+    ProxyHealth:
+      oneOf:
+        - type: object
+          required: [ok, exitIp]
+          properties:
+            ok: { type: boolean, const: true }
+            exitIp: { type: string }
+        - type: object
+          required: [ok, error]
+          properties:
+            ok: { type: boolean, const: false }
+            error: { type: string }
+            missing: { type: boolean, const: true, description: Set when the account has no proxy. }
+
+    # ── proxies ──
+    Proxy:
+      type: object
+      properties:
+        id: { type: string }
+        userId: { type: [string, 'null'] }
+        host: { type: string }
+        port: { type: integer }
+        username: { type: [string, 'null'] }
+        protocol: { $ref: '#/components/schemas/ProxyProtocol' }
+        isWorking: { type: boolean }
+        latencyMs: { type: [integer, 'null'] }
+        lastTestedAt: { type: [string, 'null'], format: date-time }
+        createdAt: { type: string, format: date-time }
+
+    # ── folders ──
+    Folder:
+      type: object
+      properties:
+        id: { type: string }
+        userId: { type: string }
+        name: { type: string }
+        type: { $ref: '#/components/schemas/FolderType' }
+        parentId: { type: [string, 'null'] }
+        createdAt: { type: string, format: date-time }
+    FolderWithCounts:
+      allOf:
+        - $ref: '#/components/schemas/Folder'
+        - type: object
+          properties:
+            _count:
+              type: object
+              properties:
+                children: { type: integer }
+                campaigns: { type: integer }
+                audiences: { type: integer }
+                instagramAccounts: { type: integer }
