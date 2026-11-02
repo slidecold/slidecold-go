@@ -6,32 +6,21 @@ on:
 
 permissions:
   contents: write
-  id-token: write
-  attestations: write
 
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
-      - uses: goreleaser/goreleaser-action@v6
-        with:
-          distribution: goreleaser
-          version: '~> v2'
-          args: release --clean
+      - name: Test
+        run: go test -race ./...
+      - name: GitHub release
+        run: gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes --title "$GITHUB_REF_NAME"
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - uses: actions/attest-build-provenance@v2
-        with:
-          subject-path: |
-            dist/*.tar.gz
-            dist/*.zip
-            dist/checksums.txt
+          GH_TOKEN: ${{ github.token }}
       - name: Ask proxy.golang.org to fetch the tag (pkg.go.dev picks it up from there)
         # The proxy can cache "unknown revision" for a just-pushed tag, so retry instead of failing the release
         run: |

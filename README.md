@@ -1,49 +1,41 @@
-# SlideCold Go SDK, CLI and MCP server
+# SlideCold Go SDK
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/slidecold/slidecold-go.svg)](https://pkg.go.dev/github.com/slidecold/slidecold-go)
 [![ci](https://github.com/slidecold/slidecold-go/actions/workflows/ci.yml/badge.svg)](https://github.com/slidecold/slidecold-go/actions/workflows/ci.yml)
 
-The official Go client for the [SlideCold](https://slidecold.com) API (Instagram cold-DM outreach), plus:
+The official Go client for the [SlideCold](https://slidecold.com) API (Instagram cold-DM outreach).
 
-- **`slidecold`**: a command-line interface for every API operation;
-- **`slidecold-mcp`**: an MCP server that exposes every operation as a tool to Claude, Cursor and other MCP clients.
-
-The SDK package uses only the Go standard library. Every operation, model and method is generated from
+The package uses only the Go standard library. Every operation, model and method is generated from
 [`openapi.yaml`](openapi.yaml) (49 operations).
+
+Looking for the command line or an MCP server?
+
+- **CLI**: [slidecold/slidecold-cli](https://github.com/slidecold/slidecold-cli) (`slidecold`);
+- **MCP server**: [slidecold/slidecold-mcp](https://github.com/slidecold/slidecold-mcp).
+
+Both moved out of this repository in v0.2.0.
 
 ## Install
 
 ```sh
-# SDK (Go >= 1.22)
-go get github.com/slidecold/slidecold-go
-
-# CLI (Go >= 1.22)
-go install github.com/slidecold/slidecold-go/cmd/slidecold@latest
-
-# MCP server (Go >= 1.25: it is a nested module because the MCP go-sdk needs Go 1.25)
-go install github.com/slidecold/slidecold-go/cmd/slidecold-mcp@latest
+go get github.com/slidecold/slidecold-go   # Go >= 1.22
 ```
 
-Prebuilt `slidecold` and `slidecold-mcp` binaries for Linux, macOS and Windows (amd64 and arm64) are attached to each
-[GitHub release](https://github.com/slidecold/slidecold-go/releases). They carry signed build provenance; verify a
-download with the [GitHub CLI](https://cli.github.com):
-
-```sh
-gh attestation verify slidecold_0.1.0_darwin_arm64.tar.gz --repo slidecold/slidecold-go
-```
+There are no binaries to download. Go verifies every module version against the
+[checksum database](https://sum.golang.org) (`go.sum`), so no separate signature or attestation is needed.
 
 ## Authentication
 
-Create an API key (`cs_...`) at <https://slidecold.com/settings>. The SDK, CLI and MCP server look for it in this order:
+Create an API key (`cs_...`) at <https://slidecold.com/settings>. The SDK looks for it in this order:
 
-1. the explicit option or flag (`slidecold.WithAPIKey`, `--api-key`);
+1. the explicit option (`slidecold.WithAPIKey`);
 2. the `SLIDECOLD_API_KEY` environment variable;
-3. the shared config file written by `slidecold login`: `{"apiKey": "cs_...", "baseUrl": "..."}`.
+3. the shared config file written by [`slidecold login`](https://github.com/slidecold/slidecold-cli): `{"apiKey": "cs_...", "baseUrl": "..."}`.
 
-The base URL resolves the same way (`WithBaseURL` / `--base-url`, `SLIDECOLD_BASE_URL`, config `baseUrl`), defaulting to
+The base URL resolves the same way (`WithBaseURL`, `SLIDECOLD_BASE_URL`, config `baseUrl`), defaulting to
 `https://slidecold.com/api/v1`.
 
-The config file is shared with the Node and Python CLIs. Its location ([`slidecold.ConfigPath`](https://pkg.go.dev/github.com/slidecold/slidecold-go#ConfigPath)):
+The config file is shared with the CLI and the other SDKs; read and write it with `LoadConfig` and `SaveConfig`. Its location ([`slidecold.ConfigPath`](https://pkg.go.dev/github.com/slidecold/slidecold-go#ConfigPath)):
 
 | Condition | Path |
 |---|---|
@@ -52,8 +44,8 @@ The config file is shared with the Node and Python CLIs. Its location ([`slideco
 | Windows | `%AppData%\slidecold\config.json` (`os.UserConfigDir`) |
 | Linux, macOS | `~/.config/slidecold/config.json` |
 
-macOS uses `~/.config` rather than `~/Library/Application Support` so all three CLIs share one file. `slidecold login`
-writes it with `0600` permissions.
+macOS uses `~/.config` rather than `~/Library/Application Support` so every SlideCold tool shares one file. `SaveConfig`
+(used by `slidecold login`) writes it with `0600` permissions.
 
 ## SDK
 
@@ -123,7 +115,7 @@ default 2 minutes). Only `GET` requests are retried, on 429, 5xx and network err
 
 Each API key carries scopes `<resource>:<read|write>` for `accounts`, `audiences`, `campaigns` and `conversations`;
 `:write` also grants `:read`. Proxies use the `accounts` scopes, and folders use the scope of their type. Every method's
-doc comment, `slidecold <resource> <action> --help`, and every MCP tool description name the scope required.
+doc comment names the scope required.
 
 ## Errors
 
@@ -160,76 +152,17 @@ http.HandleFunc("/webhooks/slidecold", func(w http.ResponseWriter, r *http.Reque
 })
 ```
 
-## CLI
-
-```text
-slidecold <resource> <action> [args] [--param value] [--data JSON|@file|@-] [--file path]
-```
-
-```sh
-slidecold login                                  # prompts for the key (or: slidecold login --key cs_...)
-slidecold campaigns list --folder-id root
-slidecold campaigns stats cmp_123
-slidecold campaigns create --data @campaign.json
-slidecold campaigns update cmp_123 --data '{"status":"PAUSED"}'
-slidecold audiences export aud_123 > members.csv  # raw CSV
-slidecold audiences import-members aud_123 --file members.csv
-slidecold conversations list --status replied --limit 50
-slidecold conversations send-photo conv_123 --file photo.jpg
-slidecold accounts login-status job_123
-slidecold logout
-```
-
-Resources are `campaigns`, `audiences`, `conversations`, `accounts`, `proxies` and `folders`. `slidecold --help`,
-`slidecold campaigns --help` and `slidecold campaigns create --help` (with endpoint, scope and the body's JSON
-Schema) document the rest. Output is pretty-printed JSON (raw CSV for exports); errors go to stderr with exit code 1.
-`--api-key` and `--base-url` override the configured values for one command.
-
-## MCP server
-
-`slidecold-mcp` is a stdio [MCP](https://modelcontextprotocol.io) server built on the official
-[Go SDK](https://github.com/modelcontextprotocol/go-sdk). It registers one tool per operation (49), named after the
-operationId in snake_case (`list_campaigns`, `get_campaign_stats`, `send_conversation_reply`, ...). Path and query
-parameters are top-level arguments, the JSON request body is the `body` argument, and uploads take a local
-`file_path`. `GET` tools are marked read-only; deletes and message sends are marked destructive. API errors come back
-as tool errors so the model can see them.
-
-**Claude Code**
-
-```sh
-claude mcp add slidecold -e SLIDECOLD_API_KEY=cs_... -- slidecold-mcp
-```
-
-**Claude Desktop** (`claude_desktop_config.json`) and **Cursor** (`~/.cursor/mcp.json` or `.cursor/mcp.json`):
-
-```json
-{
-  "mcpServers": {
-    "slidecold": {
-      "command": "slidecold-mcp",
-      "env": { "SLIDECOLD_API_KEY": "cs_..." }
-    }
-  }
-}
-```
-
-Use the absolute path of the binary (`which slidecold-mcp`) if the client does not inherit your `PATH`. If you ran
-`slidecold login`, the `env` block can be omitted.
-
 ## Development
 
 ```sh
 go generate ./...            # regenerate operations_gen.go, models_gen.go, services_gen.go from openapi.yaml
-go vet ./... && go test -race ./... ./cmd/slidecold-mcp/...
+go vet ./... && go test -race ./...
 ```
 
-The repository is a Go workspace (`go.work`): the root module (SDK and CLI, Go 1.22) and `cmd/slidecold-mcp`
-(Go 1.25). CI fails if the generated files are stale.
+CI fails if the generated files are stale.
 
-Releasing: push a `vX.Y.Z` tag; GoReleaser builds the binaries and GitHub attests them. To make
-`go install .../cmd/slidecold-mcp@vX.Y.Z` work, once the root tag is on the module proxy run
-`cd cmd/slidecold-mcp && GOWORK=off go get github.com/slidecold/slidecold-go@vX.Y.Z && GOWORK=off go mod tidy`, commit,
-and push the tag `cmd/slidecold-mcp/vX.Y.Z`.
+Releasing: push a `vX.Y.Z` tag (and bump `Version` in `slidecold.go` first). The release workflow runs the tests,
+creates a GitHub release with generated notes, and asks proxy.golang.org to fetch the tag so pkg.go.dev lists it.
 
 ## License
 
